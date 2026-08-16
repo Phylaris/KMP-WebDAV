@@ -1,0 +1,14 @@
+.gradle/
+build/
+local.properties
+# Local real-server test credentials (see webdav-test.properties.example)
+webdav-test.properties
+.idea/
+.kotlin/
+# Kotlin/JS & Wasm toolchain caches (yarn.lock is committed for reproducible builds)
+kotlin-js-store/wasm/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/

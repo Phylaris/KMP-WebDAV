@@ -1,0 +1,18 @@
+# Local configuration for the real-server integration tests
+# (src/jvmTest/kotlin/com/sylvandale/webdav/client/RealServerWebDavClientTest.kt).
+#
+# Copy this file to `webdav-test.properties` and fill in your own values.
+# `webdav-test.properties` is listed in .gitignore, so it will never be
+# committed — this example file itself may be.
+#
+# Alternative: export the environment variables WEBDAV_TEST_URL,
+# WEBDAV_TEST_USERNAME and WEBDAV_TEST_PASSWORD (they take precedence).
+
+# Jianguoyun (坚果云) WebDAV endpoint
+url=https://dav.jianguoyun.com/dav/
+
+# Your Jianguoyun account email
+username=you@example.com
+
+# The APP PASSWORD generated in 坚果云 account settings — NOT your login password
+password=replace-me
