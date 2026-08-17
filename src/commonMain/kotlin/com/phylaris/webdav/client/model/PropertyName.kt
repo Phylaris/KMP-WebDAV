@@ -25,5 +25,9 @@ data class PropertyName(
         val LOCKDISCOVERY = dav("lockdiscovery")
         val RESOURCETYPE = dav("resourcetype")
         val SUPPORTEDLOCK = dav("supportedlock")
+
+        /** Storage quota properties (RFC 4331). */
+        val QUOTA_AVAILABLE_BYTES = dav("quota-available-bytes")
+        val QUOTA_USED_BYTES = dav("quota-used-bytes")
     }
 }

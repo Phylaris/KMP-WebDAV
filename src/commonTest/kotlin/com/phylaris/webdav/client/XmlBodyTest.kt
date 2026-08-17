@@ -1,6 +1,7 @@
 package com.phylaris.webdav.client
 
 import com.phylaris.webdav.client.internal.XmlBody
+import com.phylaris.webdav.client.model.LockScope
 import com.phylaris.webdav.client.model.PropertyName
 import kotlin.test.Test
 import kotlin.test.assertContains
@@ -75,5 +76,20 @@ class XmlBodyTest {
     fun lockBodyOmitsOwnerWhenNull() {
         val body = XmlBody.lock(owner = null)
         assertTrue(!body.contains("owner"))
+    }
+
+    @Test
+    fun lockBodyDefaultsToExclusiveScope() {
+        val body = XmlBody.lock(owner = null)
+        assertContains(body, "<d:exclusive/>")
+        assertTrue(!body.contains("shared"))
+    }
+
+    @Test
+    fun lockBodySupportsSharedScope() {
+        val body = XmlBody.lock(owner = "my-app", scope = LockScope.SHARED)
+        assertContains(body, "lockscope")
+        assertContains(body, "<d:shared/>")
+        assertTrue(!body.contains("exclusive"))
     }
 }

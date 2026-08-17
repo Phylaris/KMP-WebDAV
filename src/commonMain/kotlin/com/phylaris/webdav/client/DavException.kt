@@ -79,6 +79,13 @@ class LockedException(
     responseBody: String? = null,
 ) : HttpStatusException(HttpStatusCode.Locked, method, url, responseBody)
 
+/** 304 Not Modified — the resource has not changed since the given ETag (If-None-Match). */
+class NotModifiedException(
+    method: HttpMethod,
+    url: String,
+    responseBody: String? = null,
+) : HttpStatusException(HttpStatusCode.NotModified, method, url, responseBody)
+
 /** 507 Insufficient Storage. */
 class InsufficientStorageException(
     method: HttpMethod,
@@ -89,12 +96,13 @@ class InsufficientStorageException(
 /**
  * Maps a non-success [HttpStatusCode] to the most specific [HttpStatusException] subclass.
  */
-internal fun httpStatusException(
+fun httpStatusException(
     status: HttpStatusCode,
     method: HttpMethod,
     url: String,
     responseBody: String? = null,
 ): HttpStatusException = when (status.value) {
+    304 -> NotModifiedException(method, url, responseBody)
     401 -> UnauthorizedException(method, url, responseBody)
     403 -> ForbiddenException(method, url, responseBody)
     404 -> NotFoundException(method, url, responseBody)

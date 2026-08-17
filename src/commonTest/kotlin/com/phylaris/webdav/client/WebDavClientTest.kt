@@ -1,6 +1,7 @@
 package com.phylaris.webdav.client
 
 import com.phylaris.webdav.client.internal.ProgressListener
+import com.phylaris.webdav.client.model.LockScope
 import com.phylaris.webdav.client.model.PropertyName
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
@@ -12,6 +13,7 @@ import io.ktor.client.request.HttpRequestData
 import io.ktor.client.request.HttpResponseData
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import io.ktor.http.content.OutgoingContent
@@ -23,7 +25,9 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
+import kotlin.time.Duration.Companion.minutes
 
 class WebDavClientTest {
 
@@ -530,5 +534,416 @@ class WebDavClientTest {
         assertEquals(setOf("", "sub"), directories.toSet())
         assertEquals(3, files.size)
         assertTrue(files.any { it.path == "sub/b.txt" })
+    }
+
+    // ---------------------------------------------------------------- lock extensions
+
+    @Test
+    fun lockSendsSharedScopeRequestBody() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond(
+                "<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery/></d:prop>",
+                HttpStatusCode.OK,
+                headers = headersOf("Lock-Token" to listOf("<opaquelocktoken:shared-lock>")),
+            )
+        }
+        val lock = dav.lock("f.txt", scope = LockScope.SHARED)
+        val bodyText = requests.single().body.toByteReadPacket()
+            .readByteArray().decodeToString()
+        assertTrue(bodyText.contains("<d:shared/>"))
+        assertTrue(!bodyText.contains("exclusive"))
+        assertEquals(LockScope.SHARED, lock.scope)
+    }
+
+    @Test
+    fun refreshLockSendsIfAndTimeoutHeaders() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond(
+                "<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery/></d:prop>",
+                HttpStatusCode.OK,
+                headers = headersOf("Lock-Token" to listOf("<opaquelocktoken:12345>")),
+            )
+        }
+        val lock = dav.refreshLock("f.txt", token = "opaquelocktoken:12345", timeout = 5.minutes)
+        val request = requests.single()
+        assertEquals("LOCK", request.method.value)
+        assertEquals("<opaquelocktoken:12345>", request.headers["If"])
+        assertEquals("Second-300", request.headers["Timeout"])
+        assertEquals("opaquelocktoken:12345", lock.token)
+    }
+
+    @Test
+    fun getLocksParsesActiveLocks() = runTest {
+        val xml = """
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/f.txt</d:href>
+                <d:propstat>
+                  <d:prop>
+                    <d:lockdiscovery>
+                      <d:activelock>
+                        <d:locktype><d:write/></d:locktype>
+                        <d:lockscope><d:shared/></d:lockscope>
+                        <d:depth>0</d:depth>
+                        <d:timeout>Second-1800</d:timeout>
+                        <d:locktoken><d:href>opaquelocktoken:lock-b</d:href></d:locktoken>
+                      </d:activelock>
+                    </d:lockdiscovery>
+                  </d:prop>
+                  <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>
+        """.trimIndent()
+        val dav = client { respond(xml, HttpStatusCode.MultiStatus) }
+        val locks = dav.getLocks("f.txt")
+        assertEquals(1, locks.size)
+        assertEquals("opaquelocktoken:lock-b", locks.single().token)
+        assertEquals(LockScope.SHARED, locks.single().scope)
+    }
+
+    @Test
+    fun uploadSendsIfHeaderWhenLocked() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("", HttpStatusCode.Created)
+        }
+        dav.uploadBytes("f.txt", byteArrayOf(1), lockToken = "opaquelocktoken:12345")
+        assertEquals("<opaquelocktoken:12345>", requests.single().headers["If"])
+    }
+
+    @Test
+    fun deleteSendsIfHeaderWhenLocked() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("", HttpStatusCode.NoContent)
+        }
+        dav.delete("f.txt", lockToken = "opaquelocktoken:12345")
+        assertEquals("<opaquelocktoken:12345>", requests.single().headers["If"])
+    }
+
+    @Test
+    fun moveSendsIfHeaderWhenLocked() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("", HttpStatusCode.Created)
+        }
+        dav.move("a.txt", "b.txt", lockToken = "opaquelocktoken:12345")
+        assertEquals("<opaquelocktoken:12345>", requests.single().headers["If"])
+    }
+
+    @Test
+    fun withLockUnlocksAfterBlock() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            if (request.method.value == "LOCK") {
+                respond(
+                    "<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery/></d:prop>",
+                    HttpStatusCode.OK,
+                    headers = headersOf("Lock-Token" to listOf("<opaquelocktoken:12345>")),
+                )
+            } else {
+                respond("", HttpStatusCode.NoContent)
+            }
+        }
+        val result = dav.withLock("f.txt") { lock -> lock.token }
+        assertEquals("opaquelocktoken:12345", result)
+        assertEquals(listOf("LOCK", "UNLOCK"), requests.map { it.method.value })
+    }
+
+    @Test
+    fun withLockUnlocksWhenBlockThrows() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            if (request.method.value == "LOCK") {
+                respond(
+                    "<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery/></d:prop>",
+                    HttpStatusCode.OK,
+                    headers = headersOf("Lock-Token" to listOf("<opaquelocktoken:12345>")),
+                )
+            } else {
+                respond("", HttpStatusCode.NoContent)
+            }
+        }
+        assertFailsWith<IllegalStateException> { dav.withLock("f.txt") { error("boom") } }
+        assertEquals(listOf("LOCK", "UNLOCK"), requests.map { it.method.value })
+    }
+
+    @Test
+    fun withLockToleratesUnlockFailure() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            if (request.method.value == "LOCK") {
+                respond(
+                    "<d:prop xmlns:d=\"DAV:\"><d:lockdiscovery/></d:prop>",
+                    HttpStatusCode.OK,
+                    headers = headersOf("Lock-Token" to listOf("<opaquelocktoken:12345>")),
+                )
+            } else {
+                respond("gone", HttpStatusCode.Conflict)
+            }
+        }
+        val result = dav.withLock("f.txt") { "done" }
+        assertEquals("done", result)
+        assertEquals(listOf("LOCK", "UNLOCK"), requests.map { it.method.value })
+    }
+
+    // ---------------------------------------------------------------- conditional requests
+
+    @Test
+    fun uploadSendsIfMatchHeader() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("", HttpStatusCode.Created)
+        }
+        dav.uploadBytes("f.txt", byteArrayOf(1), ifMatch = "\"etag-1\"")
+        assertEquals("\"etag-1\"", requests.single().headers[HttpHeaders.IfMatch])
+    }
+
+    @Test
+    fun uploadRejectsIfMatchCombinedWithOverwriteFalse() = runTest {
+        val dav = client { respond("", HttpStatusCode.Created) }
+        assertFailsWith<IllegalArgumentException> {
+            dav.uploadBytes("f.txt", byteArrayOf(1), overwrite = false, ifMatch = "\"etag-1\"")
+        }
+    }
+
+    @Test
+    fun downloadSendsIfNoneMatchHeader() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("content", HttpStatusCode.OK)
+        }
+        dav.downloadBytes("f.txt", ifNoneMatch = "\"etag-1\"")
+        assertEquals("\"etag-1\"", requests.single().headers[HttpHeaders.IfNoneMatch])
+    }
+
+    @Test
+    fun downloadBytesThrowsNotModifiedOn304() = runTest {
+        val dav = client { respond("", HttpStatusCode.NotModified) }
+        assertFailsWith<NotModifiedException> {
+            dav.downloadBytes("f.txt", ifNoneMatch = "\"etag-1\"")
+        }
+    }
+
+    // ---------------------------------------------------------------- capabilities
+
+    @Test
+    fun capabilitiesParsesDavHeader() = runTest {
+        val dav = client {
+            respond(
+                "",
+                HttpStatusCode.OK,
+                headers = headersOf(
+                    HttpHeaders.Allow to listOf("OPTIONS, GET, HEAD, PROPFIND, PUT, DELETE"),
+                    "DAV" to listOf("1, 2"),
+                ),
+            )
+        }
+        val caps = dav.capabilities()
+        assertTrue(caps.davClasses.contains("1"))
+        assertTrue(caps.davClasses.contains("2"))
+        assertTrue(caps.supportsLocking)
+    }
+
+    @Test
+    fun capabilitiesStripsQuotedDavTokens() = runTest {
+        val dav = client {
+            respond(
+                "",
+                HttpStatusCode.OK,
+                headers = headersOf("DAV" to listOf("\"1\", \"2\"")),
+            )
+        }
+        val caps = dav.capabilities()
+        assertEquals(setOf("1", "2"), caps.davClasses)
+        assertTrue(caps.supportsLocking)
+    }
+
+    @Test
+    fun capabilitiesReportsNoLockingWithoutDavClass2OrLockMethods() = runTest {
+        val dav = client {
+            respond(
+                "",
+                HttpStatusCode.OK,
+                headers = headersOf(
+                    HttpHeaders.Allow to listOf("OPTIONS, GET, PROPFIND"),
+                    "DAV" to listOf("1"),
+                ),
+            )
+        }
+        assertTrue(!dav.capabilities().supportsLocking)
+    }
+
+    @Test
+    fun capabilitiesSupportsLockingViaAllowFallback() = runTest {
+        val dav = client {
+            respond(
+                "",
+                HttpStatusCode.OK,
+                headers = headersOf(HttpHeaders.Allow to listOf("OPTIONS, GET, LOCK, UNLOCK")),
+            )
+        }
+        assertTrue(dav.capabilities().supportsLocking)
+    }
+
+    // ---------------------------------------------------------------- execute extension point
+
+    @Test
+    fun executeSendsCustomMethod() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("", HttpStatusCode.OK)
+        }
+        val response = dav.execute(HttpMethod("REPORT"), "f.txt")
+        assertEquals("REPORT", requests.single().method.value)
+        assertEquals(HttpStatusCode.OK, response.status)
+        dav.ensureSuccess(response, HttpMethod("REPORT"), "f.txt") // 2xx passes through
+    }
+
+    @Test
+    fun executeEnsuresSuccessMapsErrors() = runTest {
+        val dav = client { respond("missing", HttpStatusCode.NotFound) }
+        val response = dav.execute(HttpMethod("REPORT"), "missing.txt")
+        assertFailsWith<NotFoundException> {
+            dav.ensureSuccess(response, HttpMethod("REPORT"), "missing.txt")
+        }
+    }
+
+    @Test
+    fun httpStatusExceptionMapsStatusCodes() {
+        assertIs<NotModifiedException>(
+            httpStatusException(HttpStatusCode.NotModified, HttpMethod.Get, "u")
+        )
+        assertIs<UnauthorizedException>(
+            httpStatusException(HttpStatusCode.Unauthorized, HttpMethod.Get, "u")
+        )
+        assertIs<ForbiddenException>(
+            httpStatusException(HttpStatusCode.Forbidden, HttpMethod.Get, "u")
+        )
+        assertIs<NotFoundException>(
+            httpStatusException(HttpStatusCode.NotFound, HttpMethod.Get, "u")
+        )
+        assertIs<MethodNotAllowedException>(
+            httpStatusException(HttpStatusCode.MethodNotAllowed, HttpMethod.Get, "u")
+        )
+        assertIs<ConflictException>(
+            httpStatusException(HttpStatusCode.Conflict, HttpMethod.Get, "u")
+        )
+        assertIs<PreconditionFailedException>(
+            httpStatusException(HttpStatusCode.PreconditionFailed, HttpMethod.Get, "u")
+        )
+        assertIs<LockedException>(
+            httpStatusException(HttpStatusCode.Locked, HttpMethod.Get, "u")
+        )
+        assertIs<InsufficientStorageException>(
+            httpStatusException(HttpStatusCode.InsufficientStorage, HttpMethod.Get, "u")
+        )
+    }
+
+    // ---------------------------------------------------------------- convenience
+
+    @Test
+    fun headSendsHeadRequest() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond("", HttpStatusCode.OK, headers = headersOf(HttpHeaders.ContentLength, "42"))
+        }
+        val response = dav.head("f.txt")
+        assertEquals("HEAD", requests.single().method.value)
+        assertEquals(42L, response.headers[HttpHeaders.ContentLength]?.toLong())
+    }
+
+    @Test
+    fun existsReturnsFalseOn404() = runTest {
+        val dav = client { respond("nope", HttpStatusCode.NotFound) }
+        assertFalse(dav.exists("missing.txt"))
+    }
+
+    @Test
+    fun existsReturnsTrueWhenFound() = runTest {
+        val xml = """
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/f.txt</d:href>
+                <d:propstat>
+                  <d:prop><d:displayname>f.txt</d:displayname></d:prop>
+                  <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>
+        """.trimIndent()
+        val dav = client { respond(xml, HttpStatusCode.MultiStatus) }
+        assertTrue(dav.exists("f.txt"))
+    }
+
+    @Test
+    fun getPropertyNamesSendsPropnameBody() = runTest {
+        val requests = mutableListOf<HttpRequestData>()
+        val dav = client { request ->
+            requests.add(request)
+            respond(
+                """<d:multistatus xmlns:d="DAV:">
+                    <d:response>
+                      <d:href>/dav/f.txt</d:href>
+                      <d:propstat>
+                        <d:prop><d:displayname/><d:getcontentlength/><x:favorite xmlns:x="http://owncloud.org/ns"/></d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                      </d:propstat>
+                    </d:response>
+                  </d:multistatus>""",
+                HttpStatusCode.MultiStatus,
+            )
+        }
+        val names = dav.getPropertyNames("f.txt")
+        val bodyText = requests.single().body.toByteReadPacket()
+            .readByteArray().decodeToString()
+        assertTrue(bodyText.contains("<d:propname/>"))
+        assertEquals(
+            setOf(
+                PropertyName.DISPLAYNAME,
+                PropertyName.GETCONTENTLENGTH,
+                PropertyName("http://owncloud.org/ns", "favorite"),
+            ),
+            names.toSet(),
+        )
+    }
+
+    @Test
+    fun getQuotaParsesQuotaProperties() = runTest {
+        val dav = client {
+            respond(
+                """<d:multistatus xmlns:d="DAV:">
+                    <d:response>
+                      <d:href>/dav/</d:href>
+                      <d:propstat>
+                        <d:prop>
+                          <d:quota-available-bytes>1000000</d:quota-available-bytes>
+                          <d:quota-used-bytes>250000</d:quota-used-bytes>
+                        </d:prop>
+                        <d:status>HTTP/1.1 200 OK</d:status>
+                      </d:propstat>
+                    </d:response>
+                  </d:multistatus>""",
+                HttpStatusCode.MultiStatus,
+            )
+        }
+        val quota = requireNotNull(dav.getQuota())
+        assertEquals(1_000_000L, quota.availableBytes)
+        assertEquals(250_000L, quota.usedBytes)
     }
 }

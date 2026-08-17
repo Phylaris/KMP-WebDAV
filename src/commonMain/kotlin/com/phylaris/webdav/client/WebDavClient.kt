@@ -1,7 +1,6 @@
 package com.phylaris.webdav.client
 
 import com.phylaris.webdav.client.internal.ChannelReadContent
-import com.phylaris.webdav.client.internal.LockDiscoveryInfo
 import com.phylaris.webdav.client.internal.MultiStatusParser
 import com.phylaris.webdav.client.internal.MultiStatusResponse
 import com.phylaris.webdav.client.internal.ProgressListener
@@ -10,9 +9,12 @@ import com.phylaris.webdav.client.internal.XmlBody
 import com.phylaris.webdav.client.internal.copyWithProgress
 import com.phylaris.webdav.client.internal.createHttpClient
 import com.phylaris.webdav.client.internal.readBytesWithProgress
-import com.phylaris.webdav.client.model.LockToken
+import com.phylaris.webdav.client.model.LockInfo
+import com.phylaris.webdav.client.model.LockScope
+import com.phylaris.webdav.client.model.LockType
 import com.phylaris.webdav.client.model.PropValue
 import com.phylaris.webdav.client.model.PropertyName
+import com.phylaris.webdav.client.model.QuotaInfo
 import com.phylaris.webdav.client.model.WebDavFile
 import io.ktor.client.HttpClient
 import io.ktor.client.HttpClientConfig
@@ -72,9 +74,11 @@ private const val DEPTH = "Depth"
 private const val DESTINATION = "Destination"
 private const val OVERWRITE = "Overwrite"
 private const val LOCK_TOKEN = "Lock-Token"
+private const val IF_HEADER = "If"
 private const val IF_NONE_MATCH = "If-None-Match"
 private const val TIMEOUT = "Timeout"
 private const val CONTENT_RANGE = "Content-Range"
+private const val DAV = "DAV"
 
 /**
  * A WebDAV client (RFC 4918) implemented in common Kotlin for Android, iOS and JVM.
@@ -167,7 +171,7 @@ class WebDavClient(
         properties: List<PropertyName> = COMMON_PROPERTIES,
     ): List<WebDavFile> {
         val body = if (properties.isEmpty()) XmlBody.propfindAllProp() else XmlBody.propfindProps(properties)
-        val response = executeRaw(
+        val response = execute(
             PROPFIND, path,
             headers = buildHeaders {
                 append(DEPTH, depth.headerValue)
@@ -175,7 +179,7 @@ class WebDavClient(
             },
             body = body.toTextContent(),
         )
-        response.ensureSuccess(PROPFIND, path)
+        ensureSuccess(response, PROPFIND, path)
         val multiStatus = MultiStatusParser.parseMultiStatus(response.bodyAsText())
         return multiStatus.responses.mapNotNull { it.toWebDavFile() }
             .filter { it.path.isNotEmpty() }
@@ -190,7 +194,7 @@ class WebDavClient(
         properties: List<PropertyName> = COMMON_PROPERTIES,
     ): WebDavFile? {
         val body = if (properties.isEmpty()) XmlBody.propfindAllProp() else XmlBody.propfindProps(properties)
-        val response = executeRaw(
+        val response = execute(
             PROPFIND, path,
             headers = buildHeaders {
                 append(DEPTH, Depth.ZERO.headerValue)
@@ -198,7 +202,7 @@ class WebDavClient(
             },
             body = body.toTextContent(),
         )
-        response.ensureSuccess(PROPFIND, path)
+        ensureSuccess(response, PROPFIND, path)
         val multiStatus = MultiStatusParser.parseMultiStatus(response.bodyAsText())
         return multiStatus.responses.firstNotNullOfOrNull { it.toWebDavFile() }
     }
@@ -244,14 +248,25 @@ class WebDavClient(
      * Consume or cancel the response body (`bodyAsChannel()` / `bodyAsText()`);
      * the caller is responsible for closing it.
      *
-     * @param range optional byte range to download (HTTP Range request, for resume).
+     * @param range optional byte range to download (HTTP Range request, for resume)
+     * @param ifNoneMatch optional ETag; the server answers 304 Not Modified when the
+     *   resource matches (the response is returned as-is, not translated to an error)
      */
-    suspend fun download(path: String, range: LongRange? = null): HttpResponse {
+    suspend fun download(
+        path: String,
+        range: LongRange? = null,
+        ifNoneMatch: String? = null,
+    ): HttpResponse {
         val headers = buildHeaders {
             if (range != null) append(HttpHeaders.Range, "bytes=${range.first}-${range.last}")
+            if (ifNoneMatch != null) append(HttpHeaders.IfNoneMatch, ifNoneMatch)
         }
-        val response = executeRaw(HttpMethod.Get, path, headers)
-        response.ensureSuccess(HttpMethod.Get, path)
+        val response = execute(HttpMethod.Get, path, headers)
+        // 304 is a valid conditional-response outcome, not an error; the convenience
+        // downloadBytes/downloadToChannel translate it into NotModifiedException.
+        if (response.status != HttpStatusCode.NotModified) {
+            ensureSuccess(response, HttpMethod.Get, path)
+        }
         return response
     }
 
@@ -259,9 +274,13 @@ class WebDavClient(
     suspend fun downloadBytes(
         path: String,
         range: LongRange? = null,
+        ifNoneMatch: String? = null,
         onProgress: ProgressListener? = null,
     ): ByteArray {
-        val response = download(path, range)
+        val response = download(path, range, ifNoneMatch)
+        if (response.status == HttpStatusCode.NotModified) {
+            throw NotModifiedException(HttpMethod.Get, buildUrl(path).toString())
+        }
         val channel = response.bodyAsChannel()
         val expected = response.contentLength()
         return if (onProgress != null) {
@@ -276,9 +295,13 @@ class WebDavClient(
         path: String,
         sink: ByteWriteChannel,
         range: LongRange? = null,
+        ifNoneMatch: String? = null,
         onProgress: ProgressListener? = null,
     ) {
-        val response = download(path, range)
+        val response = download(path, range, ifNoneMatch)
+        if (response.status == HttpStatusCode.NotModified) {
+            throw NotModifiedException(HttpMethod.Get, buildUrl(path).toString())
+        }
         val channel = response.bodyAsChannel()
         val expected = response.contentLength()
         if (onProgress != null) {
@@ -300,6 +323,11 @@ class WebDavClient(
      *   Content-Length (chunked where supported).
      * @param overwrite if false, the request carries `If-None-Match: *` and fails
      *   with [PreconditionFailedException] when the resource already exists.
+     * @param lockToken when the resource is locked, the token obtained from [lock];
+     *   the request then carries `If: (<token>)` (RFC 4918 §7.3, required by
+     *   servers like Apache mod_dav to avoid 423 on locked resources).
+     * @param ifMatch optional ETag; the request carries `If-Match` and fails with
+     *   [PreconditionFailedException] when the resource changed (optimistic concurrency).
      */
     suspend fun uploadFromChannel(
         path: String,
@@ -307,6 +335,8 @@ class WebDavClient(
         contentLength: Long? = null,
         contentType: ContentType = ContentType.Application.OctetStream,
         overwrite: Boolean = true,
+        lockToken: String? = null,
+        ifMatch: String? = null,
         onProgress: ProgressListener? = null,
     ) {
         val body = if (onProgress != null) {
@@ -314,17 +344,19 @@ class WebDavClient(
         } else {
             ChannelReadContent(channel, contentLength, contentType)
         }
-        upload(path, body, overwrite)
+        upload(path, body, overwrite, lockToken, ifMatch)
     }
 
-    /** Uploads [bytes] as the content of [path] (PUT). */
+    /** Uploads [bytes] as the content of [path] (PUT). See [upload] for [lockToken]/[ifMatch]. */
     suspend fun uploadBytes(
         path: String,
         bytes: ByteArray,
         contentType: ContentType = ContentType.Application.OctetStream,
         overwrite: Boolean = true,
+        lockToken: String? = null,
+        ifMatch: String? = null,
     ) {
-        upload(path, ByteArrayContent(bytes, contentType), overwrite)
+        upload(path, ByteArrayContent(bytes, contentType), overwrite, lockToken, ifMatch)
     }
 
     /** Uploads a raw [OutgoingContent] body to [path] (PUT). */
@@ -332,12 +364,17 @@ class WebDavClient(
         path: String,
         content: OutgoingContent,
         overwrite: Boolean = true,
+        lockToken: String? = null,
+        ifMatch: String? = null,
     ) {
+        require(ifMatch == null || overwrite) { "ifMatch cannot be combined with overwrite=false" }
         val headers = buildHeaders {
             if (!overwrite) append(IF_NONE_MATCH, "*")
+            if (lockToken != null) append(IF_HEADER, "<$lockToken>")
+            if (ifMatch != null) append(HttpHeaders.IfMatch, ifMatch)
         }
-        val response = executeRaw(HttpMethod.Put, path, headers, content)
-        response.ensureSuccess(HttpMethod.Put, path)
+        val response = execute(HttpMethod.Put, path, headers, content)
+        ensureSuccess(response, HttpMethod.Put, path)
     }
 
     /**
@@ -350,6 +387,7 @@ class WebDavClient(
      *
      * @param offset the number of bytes already transferred successfully
      * @param totalLength the total size of the file being uploaded
+     * @param lockToken when the resource is locked, the token obtained from [lock]
      */
     suspend fun uploadResume(
         path: String,
@@ -357,6 +395,7 @@ class WebDavClient(
         offset: Long,
         totalLength: Long,
         contentType: ContentType = ContentType.Application.OctetStream,
+        lockToken: String? = null,
         onProgress: ProgressListener? = null,
     ) {
         require(offset >= 0 && totalLength > offset) { "invalid offset $offset for total $totalLength" }
@@ -368,9 +407,10 @@ class WebDavClient(
         }
         val headers = buildHeaders {
             append(CONTENT_RANGE, "bytes $offset-*/$totalLength")
+            if (lockToken != null) append(IF_HEADER, "<$lockToken>")
         }
-        val response = executeRaw(HttpMethod.Put, path, headers, body)
-        response.ensureSuccess(HttpMethod.Put, path)
+        val response = execute(HttpMethod.Put, path, headers, body)
+        ensureSuccess(response, HttpMethod.Put, path)
     }
 
     // ------------------------------------------------------------------ mutations
@@ -378,14 +418,24 @@ class WebDavClient(
     /** Creates a new collection (directory) at [path] (MKCOL). */
     suspend fun mkdir(path: String) {
         require(path.isNotBlank()) { "path must not be blank" }
-        val response = executeRaw(MKCOL, path)
-        response.ensureSuccess(MKCOL, path)
+        val response = execute(MKCOL, path)
+        ensureSuccess(response, MKCOL, path)
     }
 
-    /** Deletes the resource at [path] (DELETE). */
-    suspend fun delete(path: String) {
-        val response = executeRaw(HttpMethod.Delete, path)
-        response.ensureSuccess(HttpMethod.Delete, path)
+    /**
+     * Deletes the resource at [path] (DELETE).
+     *
+     * @param lockToken when the resource is locked, the token obtained from [lock]
+     * @param ifMatch optional ETag; the request carries `If-Match` and fails with
+     *   [PreconditionFailedException] when the resource changed
+     */
+    suspend fun delete(path: String, lockToken: String? = null, ifMatch: String? = null) {
+        val headers = buildHeaders {
+            if (lockToken != null) append(IF_HEADER, "<$lockToken>")
+            if (ifMatch != null) append(HttpHeaders.IfMatch, ifMatch)
+        }
+        val response = execute(HttpMethod.Delete, path, headers)
+        ensureSuccess(response, HttpMethod.Delete, path)
     }
 
     /** Moves the resource at [source] to [destination] (MOVE). */
@@ -393,12 +443,14 @@ class WebDavClient(
         source: String,
         destination: String,
         overwrite: Boolean = true,
+        lockToken: String? = null,
+        ifMatch: String? = null,
     ) {
-        val response = executeRaw(
+        val response = execute(
             MOVE, source,
-            headers = destinationHeaders(destination, overwrite),
+            headers = destinationHeaders(destination, overwrite, lockToken, ifMatch),
         )
-        response.ensureSuccess(MOVE, source)
+        ensureSuccess(response, MOVE, source)
     }
 
     /** Copies the resource at [source] to [destination] (COPY). */
@@ -407,16 +459,20 @@ class WebDavClient(
         destination: String,
         overwrite: Boolean = true,
         depth: Depth = Depth.INFINITY,
+        lockToken: String? = null,
+        ifMatch: String? = null,
     ) {
-        val response = executeRaw(
+        val response = execute(
             COPY, source,
             headers = buildHeaders {
                 append(DESTINATION, buildUrl(destination).toString())
                 append(OVERWRITE, if (overwrite) "T" else "F")
                 append(DEPTH, depth.headerValue)
+                if (lockToken != null) append(IF_HEADER, "<$lockToken>")
+                if (ifMatch != null) append(HttpHeaders.IfMatch, ifMatch)
             },
         )
-        response.ensureSuccess(COPY, source)
+        ensureSuccess(response, COPY, source)
     }
 
     /** Sets and/or removes properties on the resource at [path] (PROPPATCH). */
@@ -424,11 +480,15 @@ class WebDavClient(
         path: String,
         set: Map<PropertyName, String> = emptyMap(),
         remove: Set<PropertyName> = emptySet(),
+        lockToken: String? = null,
     ) {
         require(set.isNotEmpty() || remove.isNotEmpty()) { "nothing to patch" }
-        val response = executeRaw(
+        val response = execute(
             PROPPATCH, path,
-            headers = buildHeaders { append(HttpHeaders.ContentType, "application/xml; charset=utf-8") },
+            headers = buildHeaders {
+                append(HttpHeaders.ContentType, "application/xml; charset=utf-8")
+                if (lockToken != null) append(IF_HEADER, "<$lockToken>")
+            },
             body = XmlBody.proppatch(set, remove).toTextContent(),
         )
         if (response.status == HttpStatusCode.MultiStatus) {
@@ -443,70 +503,204 @@ class WebDavClient(
                 )
             }
         } else {
-            response.ensureSuccess(PROPPATCH, path)
+            ensureSuccess(response, PROPPATCH, path)
         }
     }
 
     // ------------------------------------------------------------------ locking
 
     /**
-     * Locks the resource at [path] with an exclusive write lock (LOCK).
+     * Locks the resource at [path] with a write lock (LOCK).
      *
      * @param owner optional owner information stored in the lock
      * @param timeout requested lock lifetime, e.g. [Duration.seconds] (server may grant less)
+     * @param scope the lock scope: exclusive (default) or shared (RFC 4918, section 6.1)
      */
     suspend fun lock(
         path: String,
         owner: String? = null,
         timeout: Duration? = null,
-    ): LockToken {
+        scope: LockScope = LockScope.EXCLUSIVE,
+    ): LockInfo {
         val headers = buildHeaders {
             append(DEPTH, Depth.ZERO.headerValue)
             append(HttpHeaders.ContentType, "application/xml; charset=utf-8")
             if (timeout != null) append(TIMEOUT, "Second-${timeout.inWholeSeconds}")
         }
-        val response = executeRaw(
+        val response = execute(
             LOCK, path,
             headers = headers,
-            body = XmlBody.lock(owner).toTextContent(),
+            body = XmlBody.lock(owner, scope).toTextContent(),
         )
-        response.ensureSuccess(LOCK, path)
+        ensureSuccess(response, LOCK, path)
 
         // Prefer the standard Lock-Token response header, fall back to the body.
         val headerToken = response.headers[LOCK_TOKEN]?.trim()?.removeSurrounding("<", ">")
         if (headerToken != null) {
-            return LockToken(token = headerToken)
+            return LockInfo(token = headerToken, scope = scope, type = LockType.WRITE)
         }
         val body = response.bodyAsText()
-        val discovery: LockDiscoveryInfo? = MultiStatusParser.parseLockResponse(body)
-        return if (discovery != null) {
-            LockToken(
-                token = discovery.lockToken,
-                timeoutSeconds = discovery.timeoutSeconds,
-                owner = discovery.owner,
-            )
+        val info = MultiStatusParser.parseLockResponse(body)
+        return info ?: throw DavProtocolException("LOCK on $path succeeded but no lock token was returned")
+    }
+
+    /**
+     * Refreshes an existing lock on [path], extending its lifetime (RFC 4918, section 9.10.2):
+     * a LOCK request carrying the lock token in the `If` header renews the lock instead of
+     * creating a new one.
+     *
+     * @param token the lock token to refresh, as returned by [lock]
+     * @param timeout requested new lifetime; the server may grant less
+     */
+    suspend fun refreshLock(
+        path: String,
+        token: String,
+        timeout: Duration? = null,
+    ): LockInfo {
+        val headers = buildHeaders {
+            append(DEPTH, Depth.ZERO.headerValue)
+            append(IF_HEADER, "<$token>")
+            if (timeout != null) append(TIMEOUT, "Second-${timeout.inWholeSeconds}")
+        }
+        // The body of a lock-refresh request is ignored by the server (RFC 4918 §9.10.2);
+        // sending none avoids scope-mismatch rejections on servers that validate the
+        // lockinfo against the existing lock.
+        val response = execute(LOCK, path, headers = headers)
+        ensureSuccess(response, LOCK, path)
+
+        val headerToken = response.headers[LOCK_TOKEN]?.trim()?.removeSurrounding("<", ">")
+        if (headerToken != null) {
+            return LockInfo(token = headerToken, scope = LockScope.EXCLUSIVE, type = LockType.WRITE)
+        }
+        val body = response.bodyAsText()
+        val info = MultiStatusParser.parseLockResponse(body)
+        return if (info != null) {
+            info
         } else {
-            throw DavProtocolException("LOCK on $path succeeded but no lock token was returned")
+            throw DavProtocolException("LOCK refresh on $path succeeded but no lock token was returned")
+        }
+    }
+
+    /** Returns all active locks on [path] reported by the server (PROPFIND `lockdiscovery`). */
+    suspend fun getLocks(path: String): List<LockInfo> {
+        val file = getProperties(path, properties = listOf(PropertyName.LOCKDISCOVERY))
+            ?: return emptyList()
+        return file.locks
+    }
+
+    /**
+     * Locks [path] for the duration of [block] and releases the lock afterwards.
+     *
+     * The lock is released in a `finally` block, so it is also released when [block]
+     * throws; a failed UNLOCK (e.g. the server already released the lock) is tolerated
+     * and never masks [block]'s exception or return value.
+     */
+    suspend fun <T> withLock(
+        path: String,
+        owner: String? = null,
+        timeout: Duration? = null,
+        scope: LockScope = LockScope.EXCLUSIVE,
+        block: suspend (LockInfo) -> T,
+    ): T {
+        val lock = lock(path, owner, timeout, scope)
+        try {
+            return block(lock)
+        } finally {
+            runCatching { unlock(path, lock.token) }
         }
     }
 
     /** Releases a lock held by [token] on the resource at [path] (UNLOCK). */
     suspend fun unlock(path: String, token: String) {
-        val response = executeRaw(
+        val response = execute(
             UNLOCK, path,
             headers = buildHeaders { append(LOCK_TOKEN, "<$token>") },
         )
-        response.ensureSuccess(UNLOCK, path)
+        ensureSuccess(response, UNLOCK, path)
     }
 
     // ------------------------------------------------------------------ capability probe
 
     /** Probes the server capabilities at [path] and returns the allowed methods (OPTIONS). */
     suspend fun options(path: String = ""): Set<String> {
-        val response = executeRaw(HttpMethod.Options, path)
-        response.ensureSuccess(HttpMethod.Options, path)
-        val allow = response.headers[HttpHeaders.Allow]
-        return allow?.split(',')?.map { it.trim() }?.toSet().orEmpty()
+        val response = execute(HttpMethod.Options, path)
+        ensureSuccess(response, HttpMethod.Options, path)
+        return parseAllowHeader(response)
+    }
+
+    /**
+     * Probes the server capabilities at [path] (OPTIONS) and reports both the allowed
+     * methods and the advertised `DAV` compliance classes, which are the authoritative
+     * source for WebDAV capability negotiation (1=class 1 basics, 2=class 2 locking,
+     * 3=class 3 leased locks, extended-mkcol, ...).
+     */
+    suspend fun capabilities(path: String = ""): ServerCapabilities {
+        val response = execute(HttpMethod.Options, path)
+        ensureSuccess(response, HttpMethod.Options, path)
+        return ServerCapabilities(
+            allowedMethods = parseAllowHeader(response),
+            davClasses = parseDavHeader(response),
+        )
+    }
+
+    private fun parseAllowHeader(response: HttpResponse): Set<String> =
+        response.headers[HttpHeaders.Allow]?.split(',')?.map { it.trim() }?.toSet().orEmpty()
+
+    // Some servers quote DAV tokens (e.g. `DAV: "1", "2"`), so strip surrounding quotes.
+    private fun parseDavHeader(response: HttpResponse): Set<String> =
+        response.headers[DAV]?.split(',')
+            ?.map { it.trim().removeSurrounding("\"") }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+            .orEmpty()
+
+    // ------------------------------------------------------------------ convenience
+
+    /** Issues a HEAD request and returns the response (headers only, no body). */
+    suspend fun head(path: String): HttpResponse {
+        val response = execute(HttpMethod.Head, path)
+        ensureSuccess(response, HttpMethod.Head, path)
+        return response
+    }
+
+    /** True when the resource at [path] exists (404 maps to false, other errors throw). */
+    suspend fun exists(path: String): Boolean = try {
+        getProperties(path) != null
+    } catch (e: NotFoundException) {
+        false
+    }
+
+    /** Lists the names of all properties of the resources at [path] (PROPFIND `propname`). */
+    suspend fun getPropertyNames(
+        path: String = "",
+        depth: Depth = Depth.ONE,
+    ): List<PropertyName> {
+        val response = execute(
+            PROPFIND, path,
+            headers = buildHeaders {
+                append(DEPTH, depth.headerValue)
+                append(HttpHeaders.ContentType, "application/xml; charset=utf-8")
+            },
+            body = XmlBody.propfindPropName().toTextContent(),
+        )
+        ensureSuccess(response, PROPFIND, path)
+        val multiStatus = MultiStatusParser.parseMultiStatus(response.bodyAsText())
+        return multiStatus.responses
+            .flatMap { it.propStats }
+            .flatMap { it.props.keys }
+            .distinct()
+    }
+
+    /** Quota information for the collection at [path], or null when the server reports none (RFC 4331). */
+    suspend fun getQuota(path: String = ""): QuotaInfo? {
+        val file = getProperties(
+            path,
+            properties = listOf(PropertyName.QUOTA_AVAILABLE_BYTES, PropertyName.QUOTA_USED_BYTES),
+        ) ?: return null
+        return QuotaInfo(
+            availableBytes = file.properties[PropertyName.QUOTA_AVAILABLE_BYTES]?.text?.toLongOrNull(),
+            usedBytes = file.properties[PropertyName.QUOTA_USED_BYTES]?.text?.toLongOrNull(),
+        )
     }
 
     // ------------------------------------------------------------------ internals
@@ -518,9 +712,16 @@ class WebDavClient(
     private fun buildHeaders(block: io.ktor.http.HeadersBuilder.() -> Unit): Headers =
         io.ktor.http.HeadersBuilder().apply(block).build()
 
-    private fun destinationHeaders(destination: String, overwrite: Boolean) = buildHeaders {
+    private fun destinationHeaders(
+        destination: String,
+        overwrite: Boolean,
+        lockToken: String?,
+        ifMatch: String?,
+    ) = buildHeaders {
         append(DESTINATION, buildUrl(destination).toString())
         append(OVERWRITE, if (overwrite) "T" else "F")
+        if (lockToken != null) append(IF_HEADER, "<$lockToken>")
+        if (ifMatch != null) append(HttpHeaders.IfMatch, ifMatch)
     }
 
     /** Builds the absolute URL for a logical [path]. */
@@ -602,11 +803,16 @@ class WebDavClient(
     }
 
     /**
-     * Executes a request, following redirects manually (up to [WebDavClientConfig.maxRedirects]).
+     * Executes a WebDAV request, following redirects manually (up to [WebDavClientConfig.maxRedirects]).
      * Request bodies are only sent on the first attempt; subsequent redirects are issued
      * without a body, which is safe for the common 301/302 cases where the resource moved.
+     *
+     * Unlike the higher-level methods, the response status is not checked; call
+     * [ensureSuccess] yourself to map non-2xx statuses to [HttpStatusException].
+     * This is the extension point for WebDAV methods without a dedicated wrapper
+     * (e.g. REPORT/SEARCH) and for custom headers.
      */
-    private suspend fun executeRaw(
+    suspend fun execute(
         method: HttpMethod,
         path: String,
         headers: Headers = Headers.Empty,
@@ -642,11 +848,15 @@ class WebDavClient(
         }
     }
 
-    private suspend fun HttpResponse.ensureSuccess(method: HttpMethod, path: String) {
-        if (!status.isSuccess()) {
+    /**
+     * Throws the specific [HttpStatusException] subclass for a non-success [HttpStatusCode]
+     * (see [httpStatusException]); 2xx and 3xx pass through unchanged.
+     */
+    suspend fun ensureSuccess(response: HttpResponse, method: HttpMethod, path: String) {
+        if (!response.status.isSuccess()) {
             val url = buildUrl(path).toString()
-            val body = runCatching { bodyAsText().take(MAX_ERROR_BODY) }.getOrNull()
-            throw httpStatusException(status, method, url, body)
+            val body = runCatching { response.bodyAsText().take(MAX_ERROR_BODY) }.getOrNull()
+            throw httpStatusException(response.status, method, url, body)
         }
     }
 

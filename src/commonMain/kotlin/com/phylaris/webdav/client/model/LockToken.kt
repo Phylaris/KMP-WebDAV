@@ -8,6 +8,7 @@ package com.phylaris.webdav.client.model
  * @param timeoutSeconds the server-provided timeout (may be null if not reported)
  * @param owner the owner string reported by the server, if any
  */
+@Deprecated("Replaced by LockInfo, which also carries scope/type/depth; WebDavClient.lock() now returns LockInfo")
 data class LockToken(
     val token: String,
     val timeoutSeconds: Long? = null,

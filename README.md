@@ -10,9 +10,16 @@ meant to be embedded in other apps and projects.
 - **Core file operations**: list directories (`PROPFIND`), download (`GET`), upload (`PUT`),
   delete (`DELETE`), create collections (`MKCOL`), move/copy (`MOVE`/`COPY`), read and
   modify properties (`PROPPATCH`).
-- **Advanced**: byte-range downloads (resume support), exclusive write locks
-  (`LOCK`/`UNLOCK`), recursive listing with bounded concurrency, HTTP redirects handled
-  manually (bodies and methods survive 3xx).
+- **Locking**: exclusive and shared write locks (`LOCK`/`UNLOCK`) with lock refresh,
+  lock discovery (`getLocks`), `withLock` auto-release, and lock tokens submitted via
+  the `If` header on every write operation (RFC 4918 §7.3).
+- **Conditional requests**: `If-Match` / `If-None-Match` (ETag) on uploads, downloads,
+  moves, copies and deletes for optimistic concurrency and cache validation.
+- **Advanced**: byte-range downloads (resume support), recursive listing with bounded
+  concurrency, HTTP redirects handled manually (bodies and methods survive 3xx).
+- **Capability probing**: `capabilities()` parses both the `Allow` and the `DAV`
+  compliance headers; `execute()` exposes the underlying request path for WebDAV
+  extension methods (REPORT, SEARCH, ...).
 - **Authentication**: HTTP Basic, HTTP Digest (RFC 7616), and Bearer token (OAuth2)
   through Ktor's Auth plugin.
 - **Streaming**: uploads and downloads are streamed; large files never sit in memory.
@@ -89,12 +96,26 @@ dav.copy("docs", "docs-copy")
 dav.delete("old.txt")
 dav.setProperties("f.txt", set = mapOf(PropertyName.DISPLAYNAME to "renamed"))
 
-// Locking
+// Locking (exclusive or shared), with automatic release
 val lock = dav.lock("f.txt", owner = "my-app", timeout = 5.minutes)
-dav.unlock("f.txt", lock.token)
+dav.uploadBytes("f.txt", bytes, lockToken = lock.token) // writes carry the token
+// dav.unlock("f.txt", lock.token)
+
+// Or: lock for the duration of a block, unlock guaranteed in a finally block
+val uploaded = dav.withLock("f.txt") { lock ->
+    dav.uploadBytes("f.txt", bytes, lockToken = lock.token)
+}
+
+// Refresh a lock, inspect active locks
+val refreshed = dav.refreshLock("f.txt", lock.token, timeout = 30.minutes)
+val locks = dav.getLocks("f.txt")
 
 // Resume a download
 dav.downloadToChannel("big.bin", sink, range = downloadedBytes..Long.MAX_VALUE)
+
+// Probe server capabilities (Allow + DAV compliance classes)
+val caps = dav.capabilities()
+if (caps.supportsLocking) { /* ... */ }
 ```
 
 ### Custom properties
@@ -153,6 +174,14 @@ All failures derive from `DavException`:
 
 The shared test suite covers XML parsing golden cases and protocol behavior using
 Ktor's `MockEngine` (no live server needed).
+
+## Compatibility notes
+
+- `WebDavClient.lock()` now returns `LockInfo` (with `scope`, `type` and `depth`);
+  `LockToken` is deprecated but retained. `lock.token` / `lock.timeoutSeconds` keep
+  their names, so most call sites migrate without changes.
+- `execute()` and `ensureSuccess()` are public extension points; WebDAV methods
+  without a dedicated wrapper (REPORT, SEARCH, ...) can be issued through them.
 
 ## License
 

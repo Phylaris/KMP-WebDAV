@@ -1,6 +1,10 @@
 package com.phylaris.webdav.client.internal
 
 import com.phylaris.webdav.client.DavProtocolException
+import com.phylaris.webdav.client.Depth
+import com.phylaris.webdav.client.model.LockInfo
+import com.phylaris.webdav.client.model.LockScope
+import com.phylaris.webdav.client.model.LockType
 import com.phylaris.webdav.client.model.PropValue
 import com.phylaris.webdav.client.model.PropertyName
 import nl.adaptivity.xmlutil.EventType
@@ -27,8 +31,8 @@ internal object MultiStatusParser {
      * Parses the body of a successful LOCK response (a `DAV: prop` containing
      * `lockdiscovery`). Returns null if no active lock could be found.
      */
-    fun parseLockResponse(xml: String): LockDiscoveryInfo? = parse(xml) {
-        var result: LockDiscoveryInfo? = null
+    fun parseLockResponse(xml: String): LockInfo? = parse(xml) {
+        var result: LockInfo? = null
         skipPreamble()
         if (eventType == EventType.START_ELEMENT) {
             while (next() != EventType.END_ELEMENT) {
@@ -127,6 +131,10 @@ internal object MultiStatusParser {
     /**
      * Parses the value of a property starting at its start element: a plain text value
      * or a nested element tree.
+     *
+     * Elements are always represented as [PropValue.Node] so their structure is
+     * preserved (e.g. `<href>` inside `<locktoken>`); [PropValue.Text] appears as
+     * child text content. Read text via `Node.text`, which concatenates child text.
      */
     private fun XmlReader.parseNodeValue(): PropValue {
         val name = PropertyName(namespaceURI.ifEmpty { DAV_NS }, localName)
@@ -138,37 +146,27 @@ internal object MultiStatusParser {
                 attributes.add(attrName to getAttributeValue(i))
             }
         }
-        var hasElementChild = false
         while (next() != EventType.END_ELEMENT) {
             when (eventType) {
-                EventType.START_ELEMENT -> {
-                    hasElementChild = true
-                    children.add(parseNodeValue())
-                }
+                EventType.START_ELEMENT -> children.add(parseNodeValue())
                 EventType.TEXT, EventType.CDSECT -> children.add(PropValue.Text(text))
                 EventType.ENTITY_REF -> children.add(PropValue.Text(resolveEntity(localName)))
                 else -> Unit
             }
         }
-        return if (hasElementChild || children.isEmpty()) {
-            // Element with children (e.g. <resourcetype><collection/>) or an empty
-            // element: represent as a node so element structure is preserved.
-            PropValue.Node(name, attributes, children)
-        } else {
-            // Pure text content: collapse to a text value.
-            val textValue = children.filterIsInstance<PropValue.Text>()
-                .joinToString("") { it.value }
-            PropValue.Text(textValue)
-        }
+        return PropValue.Node(name, attributes, children)
     }
 
     // --- lock discovery ---
 
-    private fun XmlReader.parseActiveLock(): LockDiscoveryInfo? {
+    private fun XmlReader.parseActiveLock(): LockInfo? {
         var lockToken: String? = null
         var timeoutSeconds: Long? = null
         var owner: String? = null
         var lockRootHref: String? = null
+        var scope = LockScope.EXCLUSIVE
+        var lockType = LockType.WRITE
+        var depth: Depth? = null
         while (next() != EventType.END_ELEMENT) {
             when {
                 eventType == EventType.START_ELEMENT && localName == "locktoken" -> {
@@ -205,12 +203,54 @@ internal object MultiStatusParser {
                         }
                     }
                 }
+                eventType == EventType.START_ELEMENT && localName == "lockscope" -> {
+                    // Child elements may be self-closing (<exclusive/>); consume each
+                    // child with skipElement so its end tag never terminates this loop.
+                    while (true) {
+                        when (next()) {
+                            EventType.START_ELEMENT -> {
+                                if (localName == "shared") scope = LockScope.SHARED
+                                skipElement()
+                            }
+                            EventType.END_ELEMENT -> break
+                            else -> Unit
+                        }
+                    }
+                }
+                eventType == EventType.START_ELEMENT && localName == "locktype" -> {
+                    while (true) {
+                        when (next()) {
+                            EventType.START_ELEMENT -> {
+                                if (localName == "write") lockType = LockType.WRITE
+                                skipElement()
+                            }
+                            EventType.END_ELEMENT -> break
+                            else -> Unit
+                        }
+                    }
+                }
+                eventType == EventType.START_ELEMENT && localName == "depth" -> {
+                    depth = when (readElementText()) {
+                        Depth.ZERO.headerValue -> Depth.ZERO
+                        Depth.ONE.headerValue -> Depth.ONE
+                        Depth.INFINITY.headerValue -> Depth.INFINITY
+                        else -> null
+                    }
+                }
                 eventType == EventType.START_ELEMENT -> skipElement()
                 else -> Unit
             }
         }
         return if (lockToken != null) {
-            LockDiscoveryInfo(lockToken, timeoutSeconds, owner, lockRootHref)
+            LockInfo(
+                token = lockToken,
+                scope = scope,
+                type = lockType,
+                depth = depth,
+                timeoutSeconds = timeoutSeconds,
+                owner = owner,
+                lockRootHref = lockRootHref,
+            )
         } else {
             null
         }
@@ -248,11 +288,3 @@ internal object MultiStatusParser {
         else -> "&$name;"
     }
 }
-
-/** Parsed `activelock` entry from a LOCK response or lockdiscovery property. */
-internal data class LockDiscoveryInfo(
-    val lockToken: String,
-    val timeoutSeconds: Long?,
-    val owner: String?,
-    val lockRootHref: String?,
-)

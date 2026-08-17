@@ -1,6 +1,10 @@
 package com.phylaris.webdav.client
 
 import com.phylaris.webdav.client.internal.MultiStatusParser
+import com.phylaris.webdav.client.model.LockInfo
+import com.phylaris.webdav.client.model.LockScope
+import com.phylaris.webdav.client.model.LockType
+import com.phylaris.webdav.client.model.PropValue
 import com.phylaris.webdav.client.model.PropertyName
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -160,10 +164,84 @@ class MultiStatusParserTest {
         """.trimIndent()
 
         val info = requireNotNull(MultiStatusParser.parseLockResponse(xml))
-        assertEquals("opaquelocktoken:e71d4fae-5dec-22d6-fea5-00a0c91e6be4", info.lockToken)
+        assertEquals("opaquelocktoken:e71d4fae-5dec-22d6-fea5-00a0c91e6be4", info.token)
+        assertEquals(LockScope.EXCLUSIVE, info.scope)
+        assertEquals(LockType.WRITE, info.type)
+        assertEquals(Depth.INFINITY, info.depth)
         assertEquals(3600L, info.timeoutSeconds)
         assertEquals("alice", info.owner)
         assertEquals("/dav/f.txt", info.lockRootHref)
+    }
+
+    @Test
+    fun parsesSharedLockResponse() {
+        val xml = """
+            <d:prop xmlns:d="DAV:">
+              <d:lockdiscovery>
+                <d:activelock>
+                  <d:locktype><d:write/></d:locktype>
+                  <d:lockscope><d:shared/></d:lockscope>
+                  <d:depth>0</d:depth>
+                  <d:timeout>Second-60</d:timeout>
+                  <d:locktoken><d:href>opaquelocktoken:shared-1</d:href></d:locktoken>
+                </d:activelock>
+              </d:lockdiscovery>
+            </d:prop>
+        """.trimIndent()
+
+        val info = requireNotNull(MultiStatusParser.parseLockResponse(xml))
+        assertEquals("opaquelocktoken:shared-1", info.token)
+        assertEquals(LockScope.SHARED, info.scope)
+        assertEquals(Depth.ZERO, info.depth)
+    }
+
+    @Test
+    fun parsesMultipleActiveLocksFromLockDiscovery() {
+        val xml = """
+            <d:multistatus xmlns:d="DAV:">
+              <d:response>
+                <d:href>/dav/f.txt</d:href>
+                <d:propstat>
+                  <d:prop>
+                    <d:lockdiscovery>
+                      <d:activelock>
+                        <d:locktype><d:write/></d:locktype>
+                        <d:lockscope><d:exclusive/></d:lockscope>
+                        <d:depth>infinity</d:depth>
+                        <d:timeout>Second-3600</d:timeout>
+                        <d:locktoken><d:href>opaquelocktoken:lock-a</d:href></d:locktoken>
+                      </d:activelock>
+                      <d:activelock>
+                        <d:locktype><d:write/></d:locktype>
+                        <d:lockscope><d:shared/></d:lockscope>
+                        <d:depth>0</d:depth>
+                        <d:owner>team</d:owner>
+                        <d:timeout>Second-1800</d:timeout>
+                        <d:locktoken><d:href>opaquelocktoken:lock-b</d:href></d:locktoken>
+                        <d:lockroot><d:href>/dav/f.txt</d:href></d:lockroot>
+                      </d:activelock>
+                    </d:lockdiscovery>
+                  </d:prop>
+                  <d:status>HTTP/1.1 200 OK</d:status>
+                </d:propstat>
+              </d:response>
+            </d:multistatus>
+        """.trimIndent()
+
+        val multiStatus = MultiStatusParser.parseMultiStatus(xml)
+        val lockDiscovery = multiStatus.responses[0].propStats[0].props[PropertyName.LOCKDISCOVERY]
+        assertNotNull(lockDiscovery)
+        val locks = (lockDiscovery as PropValue.Node)
+            .children(PropertyName.dav("activelock"))
+            .mapNotNull { LockInfo.fromActivelock(it) }
+        assertEquals(2, locks.size)
+        assertEquals("opaquelocktoken:lock-a", locks[0].token)
+        assertEquals(LockScope.EXCLUSIVE, locks[0].scope)
+        assertEquals(Depth.INFINITY, locks[0].depth)
+        assertEquals("opaquelocktoken:lock-b", locks[1].token)
+        assertEquals(LockScope.SHARED, locks[1].scope)
+        assertEquals("team", locks[1].owner)
+        assertEquals("/dav/f.txt", locks[1].lockRootHref)
     }
 
     @Test

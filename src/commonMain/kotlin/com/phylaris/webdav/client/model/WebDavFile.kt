@@ -37,11 +37,14 @@ class WebDavFile(
 
     /** True if the server reported an active lock on this resource. */
     val isLocked: Boolean
-        get() = properties[PropertyName.LOCKDISCOVERY]?.let { lockDiscovery ->
-            (lockDiscovery as? PropValue.Node)?.children(
-                PropertyName.dav("activelock")
-            )?.isNotEmpty() == true
-        } ?: false
+        get() = locks.isNotEmpty()
+
+    /** All active locks reported by the server in the `lockdiscovery` property, if any. */
+    val locks: List<LockInfo>
+        get() = (properties[PropertyName.LOCKDISCOVERY] as? PropValue.Node)
+            ?.children(PropertyName.dav("activelock"))
+            ?.mapNotNull { LockInfo.fromActivelock(it) }
+            ?: emptyList()
 
     override fun toString(): String = "WebDavFile(path=$path, isDirectory=$isDirectory)"
 }

@@ -1,5 +1,6 @@
 package com.phylaris.webdav.client.internal
 
+import com.phylaris.webdav.client.model.LockScope
 import com.phylaris.webdav.client.model.PropertyName
 
 /**
@@ -73,12 +74,14 @@ internal object XmlBody {
         append("</$DAV_PREFIX:propertyupdate>")
     }
 
-    /** LOCK request body with exclusive write lock scope. */
-    fun lock(owner: String?): String = buildString {
+    /** LOCK request body with the given lock scope (exclusive by default). */
+    fun lock(owner: String?, scope: LockScope = LockScope.EXCLUSIVE): String = buildString {
         append(XML_DECLARATION)
         append(
             "<$DAV_PREFIX:lockinfo xmlns:$DAV_PREFIX=\"$DAV_NS\">" +
-                "<$DAV_PREFIX:lockscope><$DAV_PREFIX:exclusive/></$DAV_PREFIX:lockscope>" +
+                "<$DAV_PREFIX:lockscope>" +
+                (if (scope == LockScope.SHARED) "<$DAV_PREFIX:shared/>" else "<$DAV_PREFIX:exclusive/>") +
+                "</$DAV_PREFIX:lockscope>" +
                 "<$DAV_PREFIX:locktype><$DAV_PREFIX:write/></$DAV_PREFIX:locktype>"
         )
         if (owner != null) {
