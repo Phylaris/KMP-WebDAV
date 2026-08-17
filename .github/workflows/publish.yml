@@ -46,6 +46,8 @@ jobs:
 
       - name: Publish to Maven Central
         env:
+          # Central Portal User Token 的两段（central.sonatype.com → 头像 → Account → User Token），
+          # 不是 Maven Central 登录账号密码
           SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
           SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
           # base64 编码的单行密钥，规避 GitHub Actions 对多行 secret 的破坏问题
@@ -54,9 +56,11 @@ jobs:
         run: |
           # 解码 base64 密钥，避免多行 secret 与命令行传参问题
           SIGNING_KEY="$(echo "$GPG_PRIVATE_KEY_B64" | base64 -d)"
-          ./gradlew publishAllPublicationsToMavenCentralRepository \
+          # Vanniktech 插件：发布到本地 staging 目录，build 结束后打包 bundle 上传 Central Portal
+          ./gradlew publishToMavenCentral \
+            --no-configuration-cache \
             -Pversion=${{ steps.version.outputs.version }} \
-            -Psonatype.username="$SONATYPE_USERNAME" \
-            -Psonatype.password="$SONATYPE_PASSWORD" \
+            -PmavenCentralUsername="$SONATYPE_USERNAME" \
+            -PmavenCentralPassword="$SONATYPE_PASSWORD" \
             -Psigning.privateKey="$SIGNING_KEY" \
             -Psigning.password="$GPG_PASSPHRASE"

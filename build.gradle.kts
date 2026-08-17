@@ -5,7 +5,8 @@ plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.androidLibrary)
     alias(libs.plugins.kotlinSerialization)
-    `maven-publish`
+    // Vanniktech 插件内部会应用 maven-publish 插件，并接管 Central Portal 的 bundle 上传
+    alias(libs.plugins.mavenPublish)
     signing
 }
 
@@ -100,6 +101,14 @@ android {
     }
 }
 
+// Central Portal 发布：非 SNAPSHOT 版本先发布到本地 staging 目录，build 结束时插件
+// 打包成 bundle zip 上传 portal（POST /api/v1/publisher/upload），随后可在
+// central.sonatype.com 的 Deployments 页面手动 Publish（默认不自动发布）。
+// 凭据来自 Gradle 属性 mavenCentralUsername / mavenCentralPassword（Portal User Token 的两段）。
+mavenPublishing {
+    publishToMavenCentral()
+}
+
 publishing {
     publications.withType<MavenPublication>().configureEach {
         pom {
@@ -125,16 +134,8 @@ publishing {
             }
         }
     }
-    repositories {
-        maven {
-            name = "MavenCentral"
-            url = uri("https://central.sonatype.com/api/v1/publisher")
-            credentials {
-                username = providers.gradleProperty("sonatype.username").orNull ?: ""
-                password = providers.gradleProperty("sonatype.password").orNull ?: ""
-            }
-        }
-    }
+    // 不再手动配置远程 repository：Central Portal 已移除 per-file PUT 端点（OSSRH 已于
+    // 2025-06-30 关闭），发布目标由 Vanniktech 插件统一管理。
 }
 
 signing {
