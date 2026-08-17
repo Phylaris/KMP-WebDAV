@@ -14,9 +14,6 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
-        // Mirrors first for faster downloads in CN networks; fall back to upstream.
-        maven("https://maven.aliyun.com/repository/public")
-        maven("https://maven.aliyun.com/repository/google")
         google {
             content {
                 includeGroupByRegex("com\\.android.*")

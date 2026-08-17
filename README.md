@@ -24,7 +24,7 @@ meant to be embedded in other apps and projects.
 
 | Target | Engine | Artifact |
 |---|---|---|
-| Android (minSdk 24) | OkHttp | `com.sylvandale.webdav.client` AAR |
+| Android (minSdk 24) | OkHttp | `com.phylaris.webdav.client` AAR |
 | iOS (arm64, simulator) | Darwin (NSURLSession) | `WebDavClient` XCFramework |
 | JVM | CIO | JVM jar |
 | Browser JS / Wasm | Js (browser fetch) | JS library / Wasm library |
@@ -153,3 +153,7 @@ All failures derive from `DavException`:
 
 The shared test suite covers XML parsing golden cases and protocol behavior using
 Ktor's `MockEngine` (no live server needed).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).

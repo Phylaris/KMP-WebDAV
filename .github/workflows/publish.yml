@@ -1,0 +1,62 @@
+name: Publish to Maven Central
+
+on:
+  push:
+    tags:
+      - 'v*'               # v0.1.0, v1.2.3 等 tag 推送到 GitHub 时自动发布
+  workflow_dispatch:        # 也支持手动触发（输入版本号）
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.2.0)'
+        required: true
+
+jobs:
+  publish:
+    # macOS runner 才能编译 iOS target；Ubuntu/Windows 上没有 Xcode
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Extract version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            # 从 tag 名提取版本号，如 refs/tags/v0.1.0 → 0.1.0
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Publishing version: $VERSION"
+
+      - name: Publish to Maven Central
+        env:
+          SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+          # base64 编码的单行密钥，规避 GitHub Actions 对多行 secret 的破坏问题
+          GPG_PRIVATE_KEY_B64: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          # 解码 base64 密钥，避免多行 secret 与命令行传参问题
+          SIGNING_KEY="$(echo "$GPG_PRIVATE_KEY_B64" | base64 -d)"
+          ./gradlew publishAllPublicationsToMavenCentralRepository \
+            -Pversion=${{ steps.version.outputs.version }} \
+            -Psonatype.username="$SONATYPE_USERNAME" \
+            -Psonatype.password="$SONATYPE_PASSWORD" \
+            -Psigning.privateKey="$SIGNING_KEY" \
+            -Psigning.password="$GPG_PASSPHRASE"
