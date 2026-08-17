@@ -10,7 +10,8 @@ plugins {
 }
 
 group = "io.github.phylaris"
-version = "0.1.0-SNAPSHOT"
+// -Pversion 命令行属性优先（CI 发布时由 workflow 传入），本地构建缺省用快照版本
+version = providers.gradleProperty("version").getOrElse("0.1.0-SNAPSHOT")
 
 kotlin {
     withSourcesJar()
